@@ -1,7 +1,10 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
+	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -234,19 +237,54 @@ func ExternalServiceHealthChecker(name, url string, timeout time.Duration) Healt
 	return func() HealthCheck {
 		start := time.Now()
 
-		// This is a placeholder - in real implementation you'd make HTTP request
-		// For now, simulate a check
-		time.Sleep(10 * time.Millisecond) // Simulate network call
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return HealthCheck{
+				Name:     name,
+				Status:   HealthStatusUnhealthy,
+				Message:  "Failed to create request: " + err.Error(),
+				Duration: time.Since(start),
+			}
+		}
+
+		client := &http.Client{Timeout: timeout}
+		resp, err := client.Do(req)
 		duration := time.Since(start)
+
+		if err != nil {
+			return HealthCheck{
+				Name:     name,
+				Status:   HealthStatusUnhealthy,
+				Message:  "Request failed: " + err.Error(),
+				Duration: duration,
+				Metadata: map[string]interface{}{
+					"url":              url,
+					"timeout_ms":       timeout.Milliseconds(),
+					"response_time_ms": duration.Milliseconds(),
+				},
+			}
+		}
+		defer resp.Body.Close()
+
+		status := HealthStatusHealthy
+		if resp.StatusCode >= 500 {
+			status = HealthStatusUnhealthy
+		} else if resp.StatusCode >= 400 || duration > timeout/2 {
+			status = HealthStatusDegraded
+		}
 
 		return HealthCheck{
 			Name:     name,
-			Status:   HealthStatusHealthy,
+			Status:   status,
 			Duration: duration,
 			Metadata: map[string]interface{}{
 				"url":              url,
 				"timeout_ms":       timeout.Milliseconds(),
 				"response_time_ms": duration.Milliseconds(),
+				"status_code":      resp.StatusCode,
 			},
 		}
 	}
@@ -255,8 +293,10 @@ func ExternalServiceHealthChecker(name, url string, timeout time.Duration) Healt
 // MemoryHealthChecker creates a health checker for memory usage
 func MemoryHealthChecker(maxMemoryMB int64) HealthChecker {
 	return func() HealthCheck {
-		// This is a placeholder - in real implementation you'd check actual memory usage
-		currentMemoryMB := int64(50) // Simulate current memory usage
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+
+		currentMemoryMB := int64(m.Alloc / 1024 / 1024)
 
 		status := HealthStatusHealthy
 		message := "Memory usage within normal range"
@@ -277,6 +317,8 @@ func MemoryHealthChecker(maxMemoryMB int64) HealthChecker {
 				"current_memory_mb": currentMemoryMB,
 				"max_memory_mb":     maxMemoryMB,
 				"usage_percent":     (currentMemoryMB * 100) / maxMemoryMB,
+				"heap_objects":      m.HeapObjects,
+				"gc_cycles":         m.NumGC,
 			},
 		}
 	}
@@ -285,8 +327,20 @@ func MemoryHealthChecker(maxMemoryMB int64) HealthChecker {
 // DiskHealthChecker creates a health checker for disk usage
 func DiskHealthChecker(path string, maxUsagePercent int) HealthChecker {
 	return func() HealthCheck {
-		// This is a placeholder - in real implementation you'd check actual disk usage
-		currentUsagePercent := 45 // Simulate current disk usage
+		var stat syscall.Statfs_t
+		err := syscall.Statfs(path, &stat)
+		if err != nil {
+			return HealthCheck{
+				Name:    "disk",
+				Status:  HealthStatusUnhealthy,
+				Message: "Failed to get disk stats: " + err.Error(),
+			}
+		}
+
+		totalBytes := stat.Blocks * uint64(stat.Bsize)
+		availableBytes := stat.Bavail * uint64(stat.Bsize)
+		usedBytes := totalBytes - availableBytes
+		currentUsagePercent := int((usedBytes * 100) / totalBytes)
 
 		status := HealthStatusHealthy
 		message := "Disk usage within normal range"
@@ -307,6 +361,9 @@ func DiskHealthChecker(path string, maxUsagePercent int) HealthChecker {
 				"path":              path,
 				"usage_percent":     currentUsagePercent,
 				"max_usage_percent": maxUsagePercent,
+				"total_bytes":       totalBytes,
+				"available_bytes":   availableBytes,
+				"used_bytes":        usedBytes,
 			},
 		}
 	}
